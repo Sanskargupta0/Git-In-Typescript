@@ -11,6 +11,7 @@ const Commands = {
     Init: "init",
     CatFile: "cat-file",
     HashObject: "hash-object"
+    LsTrees: "ls-trees",
 } as const;
 
 const GIT = {
@@ -21,6 +22,7 @@ const GIT = {
 
 type HashObjectArgs = [typeof Commands.HashObject, "-w", string];
 type CatFileArgs = [typeof Commands.CatFile, string, string];
+type LsTreesArgs = [typeof Commands.LsTrees, string];
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -121,6 +123,21 @@ switch (command) {
         }
 
         print(hash);
+        break;
+    }
+    case Commands.LsTrees: {
+        const dotGitPath = findNearbyGitDir(process.cwd());
+
+        const commandArgs = args as LsTreesArgs;
+        const treeHash = commandArgs[2];
+        const treeFilepath = `${dotGitPath}/objects/${treeHash.slice(0, 2)}/${treeHash.slice(2)}`;
+
+        const tree = await Bun.file(treeFilepath).arrayBuffer();
+        const decompressedBuffer = handleError(() => zlib.unzipSync(tree));
+        const nullByteIndex = decompressedBuffer.indexOf(NULL_BYTE);
+        const treeContent = decompressedBuffer.subarray(nullByteIndex + 1).toString();
+
+        print(treeContent);
         break;
     }
     default:
