@@ -1,36 +1,70 @@
-import * as fs from 'fs';
-import zlib from 'zlib';
+import * as fs from 'node:fs';
+import zlib from "node:zlib";
+// import stream from "node:stream";
+// import crypto from "node:crypto";
+import process from "node:process";
+import path from "path";
+
+const NULL_BYTE = "\0";
+
+const Commands = {
+    Init: "init",
+    CatFile: "cat-file",
+    HashObject: "hash-object"
+} as const;
+
+const GIT = {
+    types: {
+        blob: "blob",
+    }
+} as const;
+
+type HashObjectArgs = [typeof Commands.HashObject, "-w", string];
+type CatFileArgs = [typeof Commands.CatFile, string, string];
 
 const args = process.argv.slice(2);
-
-function parseArgs(args: string[]): { [key: string]: string | boolean } {
-    const argMap: { [key: string]: string | boolean } = {};
-    for (let i = 0; i < args.length; i++) {
-        if (args[i].startsWith('--')) {
-            const key = args[i].substring(2);
-            const value = (i + 1 < args.length && !args[i + 1].startsWith('-')) ? args[i + 1] : true;
-            argMap[key] = value;
-            if (value !== true) i++; // Skip the next argument as it is a value
-        } else if (args[i].startsWith('-')) {
-            const key = args[i].substring(1);
-            const value = (i + 1 < args.length && !args[i + 1].startsWith('-')) ? args[i + 1] : true;
-            argMap[key] = value;
-            if (value !== true) i++; // Skip the next argument as it is a value
-        }
-    }
-    return argMap;
-}
-
-const parsedArgs = parseArgs(args);
 const command = args[0];
 
-enum Commands {
-    Init = "init",
-    CatFile = "cat-file",
+const exit = (error: Error | undefined = undefined) => {
+    if (!error) {
+        process.exit(0);
+    } else {
+        process.stderr.write(error.message);
+        process.exit(1);
+    }
+}
+
+const print = (message: string) => process.stdout.write(message);
+
+const findNearbyGitDir = (initialPath: string) => {
+    if (!fs.existsSync(initialPath)) exit(new Error(`Path ${initialPath} does not exist`));
+    let gitDir = "";
+
+    fs.readdirSync(initialPath).forEach((file) => {
+        if (file === ".git") {
+            gitDir = path.resolve(initialPath, file);
+        }
+    });
+
+    if (gitDir) return gitDir;
+
+    const parentDir = path.resolve(initialPath, "..");
+    if (parentDir === "/") exit(new Error(`No .git directory found in ${initialPath}`));
+
+    return findNearbyGitDir(parentDir);
+}
+
+const handleError = <T>(fn: () => T) => {
+    try {
+        return fn();
+    } catch (error) {
+        exit(error as Error);
+        return undefined as T;
+    }
 }
 
 switch (command) {
-    case Commands.Init:
+    case Commands.Init: {
         // You can use print statements as follows for debugging, they'll be visible when running tests.
         console.error("Logs from your program will appear here!");
 
@@ -41,18 +75,54 @@ switch (command) {
         fs.writeFileSync(".git/HEAD", "ref: refs/heads/main\n");
         console.log("Initialized git directory");
         break;
-    case Commands.CatFile:
-        const hash = parsedArgs["p"] as string;
-        
-        const dir = hash.substring(0, 2);
-        const file = hash.substring(2);
+    }
+    case Commands.CatFile: {
+        const dotGitPath = findNearbyGitDir(process.cwd());
 
-        const blob = fs.readFileSync(`.git/objects/${dir}/${file}`);
-        const decompressedBuffer = zlib.unzipSync(blob);
-        const nullbytebuffer = decompressedBuffer.indexOf(0);
-        const blobContent = decompressedBuffer.subarray(nullbytebuffer+1).toString();
-        process.stdout.write(blobContent);
+        const commandArgs = args as CatFileArgs;
+        const objectHash = commandArgs[2];
+        const objectFilepath = `${dotGitPath}/objects/${objectHash.slice(0, 2)}/${objectHash.slice(2)}`;
+
+        const blob = await Bun.file(objectFilepath).arrayBuffer();
+        const decompressedBuffer = handleError(() => zlib.unzipSync(blob));
+        const nullByteIndex = decompressedBuffer.indexOf(NULL_BYTE);
+        const blobContent = decompressedBuffer.subarray(nullByteIndex + 1).toString();
+
+        print(blobContent);
         break;
+    }
+    case Commands.HashObject: {
+        const dotGitPath = findNearbyGitDir(process.cwd());
+
+        const commandArgs = args as HashObjectArgs;
+        const filepath = path.resolve(commandArgs[2]);
+
+        if (!await Bun.file(filepath).exists()) {
+            exit(new Error(`File ${filepath} does not exist`));
+        }
+
+        const fileContent = await Bun.file(filepath).arrayBuffer();
+        const header = await new Blob([`${GIT.types.blob} ${fileContent.byteLength}${NULL_BYTE}`]).arrayBuffer();
+        const resultingObjectBuffer = await new Blob([header, fileContent]).arrayBuffer();
+
+        const hash = new Bun.CryptoHasher("sha1").update(resultingObjectBuffer).digest("hex");
+
+        const objectHash = `${hash.slice(0, 2)}/${hash.slice(2)}`;
+        const objectFilepath = `${dotGitPath}/objects/${objectHash}`;
+
+        fs.mkdirSync(path.dirname(objectFilepath), { recursive: true });
+
+        const compressed = zlib.deflateSync(resultingObjectBuffer);
+
+        const bytesWritten = await Bun.write(objectFilepath, new Uint8Array(compressed));
+        
+        if (bytesWritten !== compressed.byteLength) {
+            exit(new Error(`Failed to write object file ${objectFilepath}. Expected ${compressed.byteLength} bytes, wrote ${bytesWritten} bytes.`));
+        }
+
+        print(hash);
+        break;
+    }
     default:
         throw new Error(`Unknown command ${command}`);
 }
